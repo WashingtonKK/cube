@@ -1,0 +1,151 @@
+# Copyright (c) Ultraviolet
+# SPDX-License-Identifier: Apache-2.0
+
+name: Deploy Cube Cloud Services
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "docker/cloud-compose.yaml"
+      - "docker/supermq-compose.yaml"
+      - "docker/.env"
+      - ".github/workflows/deploy-cloud.yaml"
+
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+          - production
+
+env:
+  DEPLOY_HOST: dev.cube.ultraviolet.rs
+  DOCKER_COMPOSE_FILE: docker/cloud-compose.yaml
+  REGISTRY: ghcr.io
+
+jobs:
+  deploy-cloud:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment || 'dev' }}
+
+    permissions:
+      contents: read
+      packages: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up SSH
+        uses: webfactory/ssh-agent@v0.8.0
+        with:
+          ssh-private-key: ${{ secrets.DEPLOY_SSH_KEY }}
+
+      - name: Add deploy host to known_hosts
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H ${{ env.DEPLOY_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Create deployment directory
+        run: |
+          ssh ${{ secrets.DEPLOY_USER }}@${{ env.DEPLOY_HOST }} "mkdir -p ~/cube-cloud"
+
+      - name: Copy deployment files
+        run: |
+          scp -r docker/* ${{ secrets.DEPLOY_USER }}@${{ env.DEPLOY_HOST }}:~/cube-cloud/
+          scp docker/.env ${{ secrets.DEPLOY_USER }}@${{ env.DEPLOY_HOST }}:~/cube-cloud/.env
+
+      - name: Configure environment variables
+        run: |
+          ssh ${{ secrets.DEPLOY_USER }}@${{ env.DEPLOY_HOST }} << 'EOF'
+            cd ~/cube-cloud
+
+            # Update agent URL to point to external CVM agent
+            if [ ! -z "${{ secrets.CUBE_AGENT_URL }}" ]; then
+              echo "UV_CUBE_AGENT_URL=${{ secrets.CUBE_AGENT_URL }}" >> .env
+            fi
+
+            # Set domain for Traefik
+            echo "CUBE_DOMAIN=${{ env.DEPLOY_HOST }}" >> .env
+          EOF
+
+      - name: Pull latest images
+        run: |
+          ssh ${{ secrets.DEPLOY_USER }}@${{ env.DEPLOY_HOST }} << 'EOF'
+            cd ~/cube-cloud
+            docker compose -f cloud-compose.yaml --profile cloud pull
+          EOF
+
+      - name: Deploy cloud services
+        run: |
+          ssh ${{ secrets.DEPLOY_USER }}@${{ env.DEPLOY_HOST }} << 'EOF'
+            cd ~/cube-cloud
+
+            # Stop existing services
+            docker compose -f cloud-compose.yaml --profile cloud down
+
+            # Start cloud services
+            docker compose -f cloud-compose.yaml --profile cloud up -d
+
+            # Wait for services to be healthy
+            echo "Waiting for services to start..."
+            sleep 30
+
+            # Check service status
+            docker compose -f cloud-compose.yaml --profile cloud ps
+          EOF
+
+      - name: Verify deployment
+        run: |
+          ssh ${{ secrets.DEPLOY_USER }}@${{ env.DEPLOY_HOST }} << 'EOF'
+            cd ~/cube-cloud
+
+            # Check if critical services are running
+            SERVICES="opensearch nats spicedb auth users cube-proxy fluent-bit"
+            ALL_RUNNING=true
+
+            for SERVICE in $SERVICES; do
+              if ! docker ps --format '{{.Names}}' | grep -q "cube-cloud-$SERVICE"; then
+                echo "ERROR: Service $SERVICE is not running"
+                ALL_RUNNING=false
+              else
+                echo "✓ Service $SERVICE is running"
+              fi
+            done
+
+            if [ "$ALL_RUNNING" = false ]; then
+              echo "Deployment verification failed!"
+              docker compose -f cloud-compose.yaml --profile cloud logs --tail=50
+              exit 1
+            fi
+
+            echo "✓ All cloud services deployed successfully!"
+          EOF
+
+      - name: Display service URLs
+        run: |
+          echo "🚀 Cube Cloud Services Deployed!"
+          echo ""
+          echo "Service URLs:"
+          echo "  - Cube Proxy API: https://${{ env.DEPLOY_HOST }}/proxy"
+          echo "  - Jaeger UI: http://${{ env.DEPLOY_HOST }}:16686"
+          echo "  - OpenSearch: http://${{ env.DEPLOY_HOST }}:9200"
+          echo ""
+          echo "To view logs:"
+          echo "  ssh ${{ secrets.DEPLOY_USER }}@${{ env.DEPLOY_HOST }} 'cd ~/cube-cloud && docker compose -f cloud-compose.yaml --profile cloud logs -f'"
+
+      - name: Notify deployment status
+        if: always()
+        run: |
+          if [ "${{ job.status }}" == "success" ]; then
+            echo "✅ Deployment to ${{ env.DEPLOY_HOST }} completed successfully"
+          else
+            echo "❌ Deployment to ${{ env.DEPLOY_HOST }} failed"
+          fi
