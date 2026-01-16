@@ -321,6 +321,7 @@ func (am *auditMiddleware) logAuditEvent(ctx context.Context, event *Event) {
 		slog.Int("status_code", event.StatusCode),
 		slog.Float64("duration_ms", event.DurationMs),
 		slog.Float64("upstream_duration_ms", event.UpstreamMs),
+		slog.Float64("upstream_ms", event.UpstreamMs),
 		slog.Int64("response_size", event.ResponseSize),
 		slog.Int64("request_size", event.RequestSize),
 	}

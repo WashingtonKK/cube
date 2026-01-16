@@ -176,8 +176,8 @@ func makeProxyHandler(
 		prxy.Director = func(req *http.Request) {
 			originalDirector(req)
 
-			// Strip domainID prefix
-			if domainID := chi.URLParam(req, "domainID"); domainID != "" {
+			// Strip domainID prefix (use domainID captured from outer scope)
+			if domainID != "" {
 				prefix := "/" + domainID
 
 				req.URL.Path = strings.TrimPrefix(req.URL.Path, prefix)
