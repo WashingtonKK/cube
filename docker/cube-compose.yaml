@@ -55,7 +55,7 @@ services:
       - ./fluent-bit.conf:/fluent-bit/etc/fluent-bit.conf:ro
       - ./parsers.conf:/fluent-bit/etc/parsers.conf:ro
       - /var/lib/docker/containers:/var/lib/docker/containers:ro
-      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # - /var/run/docker.sock:/var/run/docker.sock:ro  # Commented out due to WSL2 mount issue
     depends_on:
       opensearch:
         condition: service_healthy
@@ -226,3 +226,13 @@ services:
           create_host_path: true
     ports:
       - ${UV_CUBE_PROXY_PORT}:${UV_CUBE_PROXY_PORT}
+    labels:
+      - "logging=cube-proxy"
+      - "service=proxy"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+        labels: "logging,service"
+        tag: "cube-proxy|{{.Name}}"
