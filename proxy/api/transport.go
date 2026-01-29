@@ -1,20 +1,18 @@
 // Copyright (c) Ultraviolet
 // SPDX-License-Identifier: Apache-2.0
 
+// Package api provides HTTP transport layer for the proxy service.
 package api
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
-	"io"
 	"log"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"strings"
-	"time"
 
 	"github.com/absmach/supermq"
 	api "github.com/absmach/supermq/api/http"
@@ -22,6 +20,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	kitendpoint "github.com/go-kit/kit/endpoint"
 	kithttp "github.com/go-kit/kit/transport/http"
+	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/ultravioletrs/cube/agent/audit"
 	"github.com/ultravioletrs/cube/proxy"
@@ -31,7 +30,7 @@ import (
 
 const ContentType = "application/json"
 
-// GuardrailsConfig holds configuration for the guardrails sidecar.
+// GuardrailsConfig holds configuration for the guardrails sidecar service.
 type GuardrailsConfig struct {
 	Enabled  bool
 	URL      string
@@ -46,7 +45,7 @@ func MakeHandler(
 	idp supermq.IDProvider,
 	proxyTransport http.RoundTripper,
 	rter *router.Router,
-	guardrailsCfg GuardrailsConfig,
+	_ GuardrailsConfig,
 ) http.Handler {
 	endpoints := endpoint.MakeEndpoints(svc)
 
@@ -96,16 +95,8 @@ func MakeHandler(
 			encodeGetAttestationPolicyResponse,
 		).ServeHTTP)
 
-		// Chat completions with guardrails orchestration
-		if guardrailsCfg.Enabled {
-			r.Post("/api/chat", guardrailsHandler(
-				endpoints.ProxyRequest,
-				proxyTransport,
-				guardrailsCfg,
-			))
-		}
-
 		// Proxy all other requests using the router
+		// When guardrails is enabled, /api/chat is routed to guardrails service via config.json
 		r.Handle("/*", makeProxyHandler(endpoints.ProxyRequest, proxyTransport, rter))
 	})
 
@@ -147,56 +138,32 @@ func makeProxyHandler(
 			return
 		}
 
-		// Determine target using router
-		targetURL, stripPrefix, err := rter.DetermineTarget(r)
-		if err != nil {
-			log.Printf("Failed to determine target: %v", err)
-			http.Error(w, "Bad Gateway", http.StatusBadGateway)
+		serveReverseProxy(w, r, transport, rter)
+	}
+}
 
-			return
+// copyAttestationHeaders copies attestation and TLS-related headers from the upstream response
+// to the response writer for audit logging purposes.
+func copyAttestationHeaders(w http.ResponseWriter, resp *http.Response) {
+	auditHeaders := []string{
+		// TLS details
+		"X-TLS-Version",
+		"X-TLS-Cipher-Suite",
+		"X-TLS-Peer-Cert-Issuer",
+		// Attestation details
+		"X-Attestation-Type",
+		"X-Attestation-OK",
+		"X-Attestation-Error",
+		"X-Attestation-Nonce",
+		"X-Attestation-Report",
+		"X-ATLS-Handshake",
+		"X-ATLS-Handshake-Ms",
+	}
+
+	for _, h := range auditHeaders {
+		if v := resp.Header.Get(h); v != "" {
+			w.Header().Set(h, v)
 		}
-
-		target, err := url.Parse(targetURL)
-		if err != nil {
-			log.Printf("Invalid target URL %s: %v", targetURL, err)
-			http.Error(w, "Bad Gateway", http.StatusBadGateway)
-
-			return
-		}
-
-		prxy := httputil.NewSingleHostReverseProxy(target)
-		prxy.Transport = transport
-
-		prxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, err error) {
-			log.Printf("Proxy error: %v", err)
-			http.Error(w, "Bad Gateway", http.StatusBadGateway)
-		}
-
-		originalDirector := prxy.Director
-		prxy.Director = func(req *http.Request) {
-			originalDirector(req)
-
-			// Strip domainID prefix
-			if domainID := chi.URLParam(req, "domainID"); domainID != "" {
-				prefix := "/" + domainID
-
-				req.URL.Path = strings.TrimPrefix(req.URL.Path, prefix)
-				if req.URL.RawPath != "" {
-					req.URL.RawPath = strings.TrimPrefix(req.URL.RawPath, prefix)
-				}
-			}
-
-			// Strip configured prefix
-			if stripPrefix != "" {
-				req.URL.Path = strings.TrimPrefix(req.URL.Path, stripPrefix)
-				if req.URL.RawPath != "" {
-					req.URL.RawPath = strings.TrimPrefix(req.URL.RawPath, stripPrefix)
-				}
-			}
-		}
-
-		// Proceed to proxy
-		prxy.ServeHTTP(w, r)
 	}
 }
 
@@ -218,88 +185,90 @@ func encodeError(_ context.Context, err error, w http.ResponseWriter) {
 
 var errUnauthorized = errors.New("unauthorized")
 
-func guardrailsHandler(
-	proxyEndpoint kitendpoint.Endpoint,
-	transport http.RoundTripper,
-	cfg GuardrailsConfig,
-) http.HandlerFunc {
-	client := &http.Client{
-		Transport: transport,
-		Timeout:   120 * time.Second,
+func singleJoiningSlash(a, b string) string {
+	aslash := strings.HasSuffix(a, "/")
+
+	bslash := strings.HasPrefix(b, "/")
+	switch {
+	case aslash && bslash:
+		return a + b[1:]
+	case !aslash && !bslash:
+		return a + "/" + b
 	}
 
-	return func(w http.ResponseWriter, r *http.Request) {
-		ctx := r.Context()
-
-		session, ok := ctx.Value(mgauthn.SessionKey).(mgauthn.Session)
-		if !ok {
-			http.Error(w, "Unauthorized", http.StatusUnauthorized)
-
-			return
-		}
-
-		domainID := chi.URLParam(r, "domainID")
-
-		if _, err := proxyEndpoint(ctx, endpoint.ProxyRequestRequest{
-			Session:  session,
-			DomainID: domainID,
-			Path:     r.URL.Path,
-		}); err != nil {
-			encodeError(ctx, err, w)
-
-			return
-		}
-
-		bodyBytes, err := io.ReadAll(r.Body)
-		if err != nil {
-			http.Error(w, "Bad Request", http.StatusBadRequest)
-
-			return
-		}
-
-		r.Body.Close()
-
-		// Forward to guardrails
-		guardrailsURL := cfg.URL + "/guardrails/messages"
-		log.Printf("guardrailsHandler: Forwarding to guardrails - URL: %s", guardrailsURL)
-
-		guardrailsBody, guardrailsStatus, err := forwardRequest(ctx, client, guardrailsURL, bodyBytes)
-		if err != nil {
-			log.Printf(" guardrailsHandler: Failed to call guardrails: %v", err)
-			http.Error(w, "Bad Gateway", http.StatusBadGateway)
-
-			return
-		}
-
-		w.Header().Set("Content-Type", ContentType)
-		w.WriteHeader(guardrailsStatus)
-		_, _ = w.Write(guardrailsBody)
-	}
+	return a + b
 }
 
-func forwardRequest(
-	ctx context.Context,
-	client *http.Client,
-	railsURL string,
-	body []byte,
-) (b []byte, status int, err error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, railsURL, bytes.NewReader(body))
+func serveReverseProxy(w http.ResponseWriter, r *http.Request, transport http.RoundTripper, rter *router.Router) {
+	targetURL, stripPrefix, err := rter.DetermineTarget(r)
 	if err != nil {
-		return nil, 0, err
+		log.Printf("Failed to determine target: %v", err)
+		http.Error(w, "Bad Gateway", http.StatusBadGateway)
+
+		return
 	}
 
-	req.Header.Set("Content-Type", ContentType)
-
-	resp, err := client.Do(req)
+	target, err := url.Parse(targetURL)
 	if err != nil {
-		return nil, 0, err
-	}
-	defer resp.Body.Close()
+		log.Printf("Invalid target URL %s: %v", targetURL, err)
+		http.Error(w, "Bad Gateway", http.StatusBadGateway)
 
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, 0, err
+		return
 	}
 
-	return respBody, resp.StatusCode, nil
+	prxy := httputil.NewSingleHostReverseProxy(target)
+	prxy.Transport = transport
+
+	prxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, err error) {
+		log.Printf("Proxy error: %v", err)
+		http.Error(w, "Bad Gateway", http.StatusBadGateway)
+	}
+
+	// Add ModifyResponse hook to inject attestation headers for audit logging
+	prxy.ModifyResponse = func(resp *http.Response) error {
+		copyAttestationHeaders(w, resp)
+
+		return nil
+	}
+
+	prxy.Director = func(req *http.Request) {
+		if domainID := chi.URLParam(req, "domainID"); domainID != "" {
+			if err := uuid.Validate(domainID); err == nil {
+				prefix := "/" + domainID
+
+				req.URL.Path = strings.TrimPrefix(req.URL.Path, prefix)
+				if req.URL.RawPath != "" {
+					req.URL.RawPath = strings.TrimPrefix(req.URL.RawPath, prefix)
+				}
+			}
+		}
+
+		if stripPrefix != "" {
+			req.URL.Path = strings.TrimPrefix(req.URL.Path, stripPrefix)
+			if req.URL.RawPath != "" {
+				req.URL.RawPath = strings.TrimPrefix(req.URL.RawPath, stripPrefix)
+			}
+		}
+
+		req.URL.Scheme = target.Scheme
+		req.URL.Host = target.Host
+
+		remainingPath := req.URL.Path
+		if target.Path != "" {
+			if remainingPath == "" || remainingPath == "/" {
+				req.URL.Path = target.Path
+			} else {
+				req.URL.Path = singleJoiningSlash(target.Path, remainingPath)
+			}
+		}
+
+		req.URL.RawQuery = target.RawQuery
+		if req.URL.RawQuery == "" {
+			req.URL.RawQuery = req.URL.Query().Encode()
+		}
+
+		req.Host = target.Host
+	}
+
+	prxy.ServeHTTP(w, r)
 }
